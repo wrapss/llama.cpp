@@ -1067,6 +1067,10 @@ json server_task_result_cmpl_final::to_json_anthropic() {
         }}
     };
 
+    if (timings.prompt_n >= 0) {
+        res["timings"] = timings.to_json();
+    }
+
     return res;
 }
 
@@ -1234,18 +1238,23 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         });
     }
 
+    json message_delta_data = {
+        {"type", "message_delta"},
+        {"delta", {
+            {"stop_reason", stop_reason},
+            {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
+        }},
+        {"usage", {
+            {"output_tokens", n_decoded}
+        }}
+    };
+    if (timings.prompt_n >= 0) {
+        message_delta_data["timings"] = timings.to_json();
+    }
+
     events.push_back({
         {"event", "message_delta"},
-        {"data", {
-            {"type", "message_delta"},
-            {"delta", {
-                {"stop_reason", stop_reason},
-                {"stop_sequence", stopping_word.empty() ? nullptr : json(stopping_word)}
-            }},
-            {"usage", {
-                {"output_tokens", n_decoded}
-            }}
-        }}
+        {"data", message_delta_data}
     });
 
     events.push_back({

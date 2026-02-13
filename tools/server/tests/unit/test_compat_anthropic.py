@@ -68,8 +68,32 @@ def test_anthropic_messages_basic():
     assert isinstance(res.body["usage"]["input_tokens"], int), "input_tokens should be integer"
     assert isinstance(res.body["usage"]["output_tokens"], int), "output_tokens should be integer"
     assert res.body["usage"]["output_tokens"] > 0, "Should have generated some tokens"
-    # Anthropic API should NOT include timings
-    assert "timings" not in res.body, "Anthropic API should not include timings field"
+    # Anthropic API should include timings
+    assert "timings" in res.body, "Anthropic API should include timings field"
+    assert "prompt_n" in res.body["timings"]
+    assert "predicted_n" in res.body["timings"]
+    assert "predicted_per_second" in res.body["timings"]
+
+
+def test_anthropic_messages_timings_opt_in():
+    """Test Anthropic timings when explicitly requested"""
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 50,
+        "timings_per_token": True,
+        "messages": [
+            {"role": "user", "content": "Say hello"}
+        ]
+    })
+
+    assert res.status_code == 200
+    assert "timings" in res.body, "Anthropic API should include timings when timings_per_token=true"
+    assert "prompt_n" in res.body["timings"]
+    assert "predicted_n" in res.body["timings"]
+    assert "predicted_per_second" in res.body["timings"]
+    assert res.body["timings"]["predicted_n"] > 0
 
 
 def test_anthropic_messages_with_system():
@@ -197,11 +221,36 @@ def test_anthropic_messages_streaming():
     assert message_delta["delta"]["stop_reason"] in ["end_turn", "max_tokens"]
     assert "usage" in message_delta
     assert message_delta["usage"]["output_tokens"] > 0
+    assert "timings" in message_delta
+    assert "predicted_per_second" in message_delta["timings"]
+    assert message_delta["timings"]["predicted_n"] > 0
 
     # Check message_stop
     message_stop = next(e for e in events if e["type"] == "message_stop")
     # message_stop should NOT have timings for Anthropic API
     assert "timings" not in message_stop, "Anthropic streaming should not include timings"
+
+
+def test_anthropic_messages_streaming_timings_opt_in():
+    """Test Anthropic streaming timings when explicitly requested"""
+    server.start()
+
+    res = server.make_stream_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 30,
+        "timings_per_token": True,
+        "messages": [
+            {"role": "user", "content": "Say hello"}
+        ],
+        "stream": True
+    })
+
+    events = list(res)
+    message_delta = next(e for e in events if e["type"] == "message_delta")
+
+    assert "timings" in message_delta, "Anthropic streaming should include timings when timings_per_token=true"
+    assert "predicted_per_second" in message_delta["timings"]
+    assert message_delta["timings"]["predicted_n"] > 0
 
 
 # Token counting tests
