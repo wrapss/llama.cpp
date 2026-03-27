@@ -1267,6 +1267,89 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
     return data;
 }
 
+// LFM2.5 format (e.g. LFM2.5-1.2B-Instruct):
+// - Reasoning: <think>{reasoning}</think> (optional, only if enable_thinking is true)
+// - Tool calls: [function_name(arg1="value1", arg2="value2")] (NO <|tool_call_start|> markers)
+// - Content: text after tool calls (optional)
+// Unlike LFM2, this format has NO <|tool_call_start|>/<|tool_call_end|> wrappers.
+// Tool calls come BEFORE content, right at the start of the response (after optional thinking).
+static common_chat_params common_chat_params_init_lfm25(const common_chat_template &         tmpl,
+                                                        const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    data.preserved_tokens  = {
+        "<think>",
+        "</think>",
+    };
+
+    const std::string THINK_START = "<think>";
+    const std::string THINK_END   = "</think>";
+
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tag   = THINK_END;
+
+    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto end = p.end();
+
+        auto reasoning = p.eps();
+        if (extract_reasoning && inputs.enable_thinking) {
+            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+        }
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return wrap_for_generation_prompt(p, reasoning + p.content(p.rest()) + end, inputs,
+                THINK_START);
+        }
+
+        // Tool calls come first, then content (no start/end markers)
+        auto tool_calls = p.rule("tool-calls",
+            p.trigger_rule("tool-call",
+                p.python_style_tool_calls(inputs.tools, inputs.parallel_tool_calls)
+            )
+        );
+
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            return wrap_for_generation_prompt(p, reasoning + tool_calls + p.content(p.rest()) + end,
+                inputs, THINK_START);
+        }
+
+        // AUTO: tool calls are optional
+        return wrap_for_generation_prompt(
+            p, reasoning + p.optional(tool_calls) + p.content(p.rest()) + end, inputs, THINK_START);
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto         schema   = function.at("parameters");
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        if (data.grammar_lazy) {
+            // Trigger when [ appears at the start of response or right after </think>
+            // Capturing group ensures grammar activation starts at [ not at </think>
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "(?:^|</think>[ \\t\\n]*)(\\[)" }
+            };
+        }
+    }
+
+    return data;
+}
+
 // LFM2 format:
 // - Reasoning: <think>{reasoning}</think> (optional, only if enable_thinking is true)
 // - Content: text after reasoning (optional)
@@ -1522,6 +1605,14 @@ static std::optional<common_chat_params> try_specialized_template(
         src.find("<|tool_call_begin|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
         return common_chat_params_init_kimi_k2(tmpl, params);
+    }
+
+    // LFM2.5 - uses [name(args)] format WITHOUT <|tool_call_start|> markers
+    // Detection: has keep_past_thinking (LFM2.5 feature) and no <|tool_list_start|> markers
+    if (src.find("keep_past_thinking") != std::string::npos &&
+        src.find("<|tool_list_start|>") == std::string::npos) {
+        LOG_DBG("Using specialized template: LFM2.5\n");
+        return common_chat_params_init_lfm25(tmpl, params);
     }
 
     // LFM2 - uses <|tool_list_start|>/<|tool_list_end|> markers and <|tool_call_start|>[name(args)]<|tool_call_end|> format
