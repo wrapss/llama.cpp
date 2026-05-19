@@ -65,8 +65,13 @@ static ggml_tensor * ggml_mul_mat_aux(
 
     ggml_tensor * res;
 
-    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d   (ctx, cur, n, ggml_nelements(cur)/n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    }
     res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
@@ -843,6 +848,9 @@ void llm_graph_result::set_outputs() {
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
     }
+    if (t_h_pre_norm != nullptr) {
+        ggml_set_output(t_h_pre_norm);
+    }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
             ggml_set_output(t);
@@ -1077,9 +1085,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
         // fused QKV path
         ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
         cb(qkv, "wqkv", il);
-        if (layer.bqkv) {
-            qkv = ggml_add(ctx0, qkv, layer.bqkv);
-            cb(qkv, "bqkv", il);
+        if (layer.wqkv_b) {
+            qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
+            cb(qkv, "wqkv_b", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
             qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
@@ -1097,8 +1105,8 @@ llm_graph_qkv llm_graph_context::build_qkv(
         // separate Q/K/V path
         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
         cb(Qcur, "Qcur", il);
-        if (layer.bq) {
-            Qcur = ggml_add(ctx0, Qcur, layer.bq);
+        if (layer.wq_b) {
+            Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
             cb(Qcur, "Qcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
@@ -1107,8 +1115,8 @@ llm_graph_qkv llm_graph_context::build_qkv(
         }
         Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
         cb(Kcur, "Kcur", il);
-        if (layer.bk) {
-            Kcur = ggml_add(ctx0, Kcur, layer.bk);
+        if (layer.wk_b) {
+            Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
             cb(Kcur, "Kcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
@@ -1117,8 +1125,8 @@ llm_graph_qkv llm_graph_context::build_qkv(
         }
         Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
         cb(Vcur, "Vcur", il);
-        if (layer.bv) {
-            Vcur = ggml_add(ctx0, Vcur, layer.bv);
+        if (layer.wv_b) {
+            Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
             cb(Vcur, "Vcur", il);
         }
         if (hparams.f_clamp_kqv > 0.0f) {
@@ -2523,7 +2531,8 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    GGML_UNUSED(rs_size);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
